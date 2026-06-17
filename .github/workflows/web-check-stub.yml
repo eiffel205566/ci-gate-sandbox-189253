@@ -1,0 +1,15 @@
+name: "Platform - Web - Format & Type check"
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Simulated type check
+        run: |
+          if grep -q FAIL status.txt; then
+            echo "::error::Type error found (simulated)"; exit 1
+          fi
+          echo "type check passed"

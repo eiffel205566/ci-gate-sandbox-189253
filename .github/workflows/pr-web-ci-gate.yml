@@ -1,0 +1,147 @@
+name: "PR Web CI Gate"
+
+# Single "catch-all" merge gate for the WillowApp Web pipeline.
+#
+# It runs AFTER the web CI workflows finish (via `workflow_run`), reads their
+# conclusions for the PR's head commit, and posts ONE unresolved review comment
+# on a changed file when any of them failed — removing it automatically once they
+# all pass.
+#
+# Why a comment blocks the merge: `main` already enforces
+# "Require conversation resolution before merging", so an unresolved review thread
+# disables the merge button. No branch-protection / ruleset change is required.
+#
+# Limitations:
+#   * Soft block — anyone with write access can click "Resolve conversation" and
+#     merge anyway. For a hard, un-bypassable block, add a required status check
+#     to branch protection instead.
+#   * The block comment must be a *review* comment on a changed file; plain PR
+#     conversation (issue) comments do not count toward conversation resolution.
+
+on:
+  workflow_run:
+    workflows:
+      - "Platform - Web - Format & Type check"
+      - "Platform - Web - Test"
+      - "Platform - Web - Build"
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  actions: read
+  contents: read
+
+jobs:
+  gate:
+    # Only gate pull-request-triggered runs (ignore pushes to main, etc.).
+    if: ${{ github.event.workflow_run.event == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate web gates and update block comment
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        with:
+          script: |
+            const WATCHED = [
+              "Platform - Web - Format & Type check",
+              "Platform - Web - Test",
+              "Platform - Web - Build",
+            ];
+            const MARKER = "<!-- ci-gate:web -->";
+            const PASS = ["success", "skipped", "neutral"];
+            const headSha = process.env.HEAD_SHA;
+            const { owner, repo } = context.repo;
+
+            // 1) Find the open PR for this commit.
+            const assoc = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner, repo, commit_sha: headSha,
+            });
+            const pr = assoc.data.find((p) => p.state === "open");
+            if (!pr) {
+              core.info(`No open PR associated with ${headSha}; nothing to do.`);
+              return;
+            }
+            const pull_number = pr.number;
+
+            // If newer commits exist, these results are stale — a fresh run will settle it.
+            if (pr.head.sha !== headSha) {
+              core.info(`Run is for ${headSha} but PR head is ${pr.head.sha}; skipping stale evaluation.`);
+              return;
+            }
+
+            // 2) Latest run per watched workflow for this commit.
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+              owner, repo, head_sha: headSha, event: "pull_request", per_page: 100,
+            });
+            const latestByName = new Map();
+            for (const r of runs) {
+              if (!WATCHED.includes(r.name)) continue;
+              const prev = latestByName.get(r.name);
+              if (!prev || r.run_number > prev.run_number) latestByName.set(r.name, r);
+            }
+            const present = [...latestByName.values()];
+            const pending = present.filter((r) => r.status !== "completed").map((r) => r.name);
+            const failed = present
+              .filter((r) => r.status === "completed" && !PASS.includes(r.conclusion))
+              .map((r) => r.name);
+
+            core.info(`watched: ${present.map((r) => `${r.name}=${r.conclusion || r.status}`).join(", ") || "none"}`);
+            core.info(`pending: ${pending.join(", ") || "none"} | failed: ${failed.join(", ") || "none"}`);
+
+            // 3) Find any existing block comment we posted before.
+            const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
+              owner, repo, pull_number, per_page: 100,
+            });
+            const mine = reviewComments.filter((c) => (c.body || "").includes(MARKER));
+
+            async function removeBlock() {
+              for (const c of mine) {
+                await github.rest.pulls.deleteReviewComment({ owner, repo, comment_id: c.id });
+              }
+              if (mine.length) core.info(`Removed ${mine.length} block comment(s).`);
+            }
+
+            // 4) Decide.
+            if (failed.length > 0) {
+              const body = [
+                MARKER,
+                `### ⛔ Merge blocked — Web CI failed`,
+                ``,
+                `The following web CI gate(s) did not pass:`,
+                ...failed.map((n) => `- \`${n}\``),
+                ``,
+                `This PR is blocked until they pass. Push a fix or re-run the job — this comment is removed automatically when all web gates are green.`,
+              ].join("\n");
+
+              if (mine.length > 0) {
+                await github.rest.pulls.updateReviewComment({ owner, repo, comment_id: mine[0].id, body });
+                core.info("Refreshed existing block comment.");
+                return;
+              }
+
+              // A resolvable review thread must hang off a changed file.
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number, per_page: 100,
+              });
+              const target = files.find((f) => f.status !== "removed") || files[0];
+              if (!target) {
+                core.warning("No changed file to attach the block comment to; cannot post block.");
+                return;
+              }
+              await github.rest.pulls.createReviewComment({
+                owner, repo, pull_number, body,
+                commit_id: pr.head.sha, path: target.filename, subject_type: "file",
+              });
+              core.info(`Posted block comment on ${target.filename}.`);
+              return;
+            }
+
+            if (pending.length > 0) {
+              core.info("Some web gates still pending; leaving comment state unchanged.");
+              return;
+            }
+
+            // Nothing failed, nothing pending → all clear.
+            await removeBlock();
+            core.info("All web gates passed; PR not blocked by web CI.");
