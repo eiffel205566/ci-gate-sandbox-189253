@@ -31,6 +31,13 @@ permissions:
   actions: read
   contents: read
 
+# Serialize evaluations for the same commit. The gate fires once per watched
+# workflow completion (up to 3x per commit) plus on reruns; without this, parallel
+# runs race and can post duplicate block comments or delete each other's.
+concurrency:
+  group: pr-web-ci-gate-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
 jobs:
   gate:
     # Only gate pull-request-triggered runs (ignore pushes to main, etc.).
@@ -71,6 +78,11 @@ jobs:
             }
 
             // 2) Latest run per watched workflow for this commit.
+            //    NOTE: we evaluate only the watched workflows that actually produced a run.
+            //    The web workflows are path-filtered, so a given PR may legitimately trigger
+            //    only some of them — requiring all three to be present would deadlock those
+            //    PRs (waiting forever on a workflow that will never run). The gate fires again
+            //    on each completion, so the final firing has the complete picture.
             const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
               owner, repo, head_sha: headSha, event: "pull_request", per_page: 100,
             });
@@ -89,21 +101,55 @@ jobs:
             core.info(`watched: ${present.map((r) => `${r.name}=${r.conclusion || r.status}`).join(", ") || "none"}`);
             core.info(`pending: ${pending.join(", ") || "none"} | failed: ${failed.join(", ") || "none"}`);
 
-            // 3) Find any existing block comment we posted before.
-            const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
-              owner, repo, pull_number, per_page: 100,
-            });
-            const mine = reviewComments.filter((c) => (c.body || "").includes(MARKER));
+            // 3) Inspect existing gate threads (GraphQL so we can see resolution state).
+            const threadData = await github.graphql(
+              `query ($owner: String!, $repo: String!, $pr: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 100) {
+                      nodes { isResolved comments(first: 20) { nodes { databaseId body } } }
+                    }
+                  }
+                }
+              }`,
+              { owner, repo, pr: pull_number },
+            );
+            const threads = threadData.repository.pullRequest.reviewThreads.nodes;
+            const markerThreads = threads.filter((t) =>
+              t.comments.nodes.some((c) => (c.body || "").includes(MARKER)),
+            );
+            const markerCommentIds = markerThreads.flatMap((t) =>
+              t.comments.nodes.filter((c) => (c.body || "").includes(MARKER)).map((c) => c.databaseId),
+            );
+            const hasUnresolvedMarker = markerThreads.some((t) => !t.isResolved);
 
-            async function removeBlock() {
-              for (const c of mine) {
-                await github.rest.pulls.deleteReviewComment({ owner, repo, comment_id: c.id });
+            async function deleteMarkerComments() {
+              for (const id of markerCommentIds) {
+                await github.rest.pulls.deleteReviewComment({ owner, repo, comment_id: id });
               }
-              if (mine.length) core.info(`Removed ${mine.length} block comment(s).`);
+              if (markerCommentIds.length) core.info(`Deleted ${markerCommentIds.length} gate comment(s).`);
             }
 
             // 4) Decide.
             if (failed.length > 0) {
+              // Already blocking with a live (unresolved) thread → idempotent no-op.
+              if (hasUnresolvedMarker) {
+                core.info("An unresolved gate comment already blocks this PR; leaving it.");
+                return;
+              }
+              // Either no gate comment, or it was resolved (a bypass). Remove any stale
+              // ones and post a FRESH thread — a new thread is unresolved by default, so
+              // resolving-then-pushing-still-red re-blocks the PR.
+              await deleteMarkerComments();
+
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number, per_page: 100,
+              });
+              const target = files.find((f) => f.status !== "removed") || files[0];
+              if (!target) {
+                core.warning("No changed file to attach the block comment to; cannot post block.");
+                return;
+              }
               const body = [
                 MARKER,
                 `### ⛔ Merge blocked — Web CI failed`,
@@ -113,22 +159,6 @@ jobs:
                 ``,
                 `This PR is blocked until they pass. Push a fix or re-run the job — this comment is removed automatically when all web gates are green.`,
               ].join("\n");
-
-              if (mine.length > 0) {
-                await github.rest.pulls.updateReviewComment({ owner, repo, comment_id: mine[0].id, body });
-                core.info("Refreshed existing block comment.");
-                return;
-              }
-
-              // A resolvable review thread must hang off a changed file.
-              const files = await github.paginate(github.rest.pulls.listFiles, {
-                owner, repo, pull_number, per_page: 100,
-              });
-              const target = files.find((f) => f.status !== "removed") || files[0];
-              if (!target) {
-                core.warning("No changed file to attach the block comment to; cannot post block.");
-                return;
-              }
               await github.rest.pulls.createReviewComment({
                 owner, repo, pull_number, body,
                 commit_id: pr.head.sha, path: target.filename, subject_type: "file",
@@ -142,6 +172,6 @@ jobs:
               return;
             }
 
-            // Nothing failed, nothing pending → all clear.
-            await removeBlock();
+            // Nothing failed, nothing pending → all clear: remove any gate comments.
+            await deleteMarkerComments();
             core.info("All web gates passed; PR not blocked by web CI.");
