@@ -63,7 +63,6 @@ jobs:
             const BOT = "github-actions[bot]";
             const PASS = ["success", "skipped", "neutral"];
             const headSha = process.env.HEAD_SHA;
-            const server = process.env.GITHUB_SERVER_URL || "https://github.com";
             const { owner, repo } = context.repo;
 
             // 1) Find the open PR for this commit.
@@ -100,9 +99,10 @@ jobs:
             }
             const present = [...latestByName.values()];
             const pending = present.filter((r) => r.status !== "completed").map((r) => r.name);
-            const failed = present
-              .filter((r) => r.status === "completed" && !PASS.includes(r.conclusion))
-              .map((r) => r.name);
+            const failedRuns = present.filter(
+              (r) => r.status === "completed" && !PASS.includes(r.conclusion),
+            );
+            const failed = failedRuns.map((r) => r.name);
 
             core.info(`watched: ${present.map((r) => `${r.name}=${r.conclusion || r.status}`).join(", ") || "none"}`);
             core.info(`pending: ${pending.join(", ") || "none"} | failed: ${failed.join(", ") || "none"}`);
@@ -135,11 +135,10 @@ jobs:
                 MARKER,
                 `### ⛔ Merge blocked — Web CI failed`,
                 ``,
-                `The following web CI gate(s) did not pass:`,
-                ...failed.map((n) => `- \`${n}\``),
+                `These web CI checks failed — open them to see why and fix:`,
+                ...failedRuns.map((r) => `- [\`${r.name}\`](${r.html_url}) ❌`),
                 ``,
-                `This PR is blocked until they pass. See the [Checks tab](${server}/${owner}/${repo}/pull/${pull_number}/checks). ` +
-                  `This review is dismissed automatically when all web gates are green.`,
+                `Push a fix (or re-run the job). This review is dismissed automatically once all web checks pass.`,
               ].join("\n");
               await github.rest.pulls.createReview({
                 owner, repo, pull_number, event: "REQUEST_CHANGES", body,
