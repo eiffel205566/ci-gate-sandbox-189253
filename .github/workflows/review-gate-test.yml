@@ -1,0 +1,36 @@
+name: "Review Gate Test"
+on:
+  workflow_dispatch:
+    inputs:
+      pr: { required: true, type: string }
+      mode: { required: true, type: string }  # request | dismiss | approve
+permissions:
+  pull-requests: write
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PR: ${{ inputs.pr }}
+          MODE: ${{ inputs.mode }}
+        with:
+          script: |
+            const pull_number = parseInt(process.env.PR);
+            const mode = process.env.MODE;
+            const { owner, repo } = context.repo;
+            if (mode === 'request') {
+              const r = await github.rest.pulls.createReview({ owner, repo, pull_number, event: 'REQUEST_CHANGES', body: '⛔ CI gate (test): changes requested by github-actions bot' });
+              core.info('REQUEST_CHANGES review id=' + r.data.id + ' state=' + r.data.state);
+            } else if (mode === 'approve') {
+              const r = await github.rest.pulls.createReview({ owner, repo, pull_number, event: 'APPROVE', body: 'gate cleared' });
+              core.info('APPROVE id=' + r.data.id);
+            } else if (mode === 'dismiss') {
+              const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number });
+              for (const rv of reviews) {
+                if (rv.state === 'CHANGES_REQUESTED') {
+                  await github.rest.pulls.dismissReview({ owner, repo, pull_number, review_id: rv.id, message: 'gate cleared (test)' });
+                  core.info('dismissed id=' + rv.id + ' by ' + rv.user.login);
+                }
+              }
+            }
