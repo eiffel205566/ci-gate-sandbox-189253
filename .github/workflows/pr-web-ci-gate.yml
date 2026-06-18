@@ -146,8 +146,17 @@ jobs:
                 await github.rest.pulls.dismissReview({
                   owner, repo, pull_number, review_id: r.id, message: "All web CI gates passed — gate cleared.",
                 });
+                // Hide the now-dismissed review so it doesn't linger as an outdated entry.
+                try {
+                  await github.graphql(
+                    `mutation ($id: ID!) { minimizeComment(input: { subjectId: $id, classifier: OUTDATED }) { clientMutationId } }`,
+                    { id: r.node_id },
+                  );
+                } catch (e) {
+                  core.info(`Could not minimize review ${r.id}: ${e.message}`);
+                }
               }
-              if (ourActiveBlocks.length) core.info(`Dismissed ${ourActiveBlocks.length} gate review(s).`);
+              if (ourActiveBlocks.length) core.info(`Dismissed + hid ${ourActiveBlocks.length} gate review(s).`);
             }
 
             async function ensureBlock(body) {
