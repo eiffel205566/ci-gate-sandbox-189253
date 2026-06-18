@@ -3,20 +3,24 @@ name: "PR Web CI Gate"
 # Single "catch-all" merge gate for the WillowApp Web pipeline.
 #
 # It runs AFTER the web CI workflows finish (via `workflow_run`), reads their
-# conclusions for the PR's head commit, and posts ONE unresolved review comment
-# on a changed file when any of them failed — removing it automatically once they
-# all pass.
+# conclusions for the PR's head commit, and submits a "Request changes" review
+# from github-actions[bot] when any of them failed — dismissing it automatically
+# once they all pass.
 #
-# Why a comment blocks the merge: `main` already enforces
-# "Require conversation resolution before merging", so an unresolved review thread
+# Why a review blocks the merge: `main` enforces "Require pull request reviews",
+# so an open CHANGES_REQUESTED review sets reviewDecision = CHANGES_REQUESTED and
 # disables the merge button. No branch-protection / ruleset change is required.
 #
+# Why a review (not a comment): it needs no changed-file anchor, survives across
+# pushes (dismiss_stale only drops *approvals*, not changes-requested), and
+# re-blocking after a bypass is just "submit another review".
+#
 # Limitations:
-#   * Soft block — anyone with write access can click "Resolve conversation" and
-#     merge anyway. For a hard, un-bypassable block, add a required status check
-#     to branch protection instead.
-#   * The block comment must be a *review* comment on a changed file; plain PR
-#     conversation (issue) comments do not count toward conversation resolution.
+#   * Soft block — anyone with write access can dismiss the review and merge
+#     anyway. For a hard, un-bypassable block, add a required status check to
+#     branch protection instead.
+#   * On green it DISMISSES (never APPROVES) — approving would wrongly count
+#     toward the human review-approval requirement.
 
 on:
   workflow_run:
@@ -33,7 +37,7 @@ permissions:
 
 # Serialize evaluations for the same commit. The gate fires once per watched
 # workflow completion (up to 3x per commit) plus on reruns; without this, parallel
-# runs race and can post duplicate block comments or delete each other's.
+# runs race and can submit duplicate reviews.
 concurrency:
   group: pr-web-ci-gate-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: false
@@ -44,7 +48,7 @@ jobs:
     if: ${{ github.event.workflow_run.event == 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Evaluate web gates and update block comment
+      - name: Evaluate web gates and update blocking review
         uses: actions/github-script@v7
         env:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -56,8 +60,10 @@ jobs:
               "Platform - Web - Build",
             ];
             const MARKER = "<!-- ci-gate:web -->";
+            const BOT = "github-actions[bot]";
             const PASS = ["success", "skipped", "neutral"];
             const headSha = process.env.HEAD_SHA;
+            const server = process.env.GITHUB_SERVER_URL || "https://github.com";
             const { owner, repo } = context.repo;
 
             // 1) Find the open PR for this commit.
@@ -101,53 +107,28 @@ jobs:
             core.info(`watched: ${present.map((r) => `${r.name}=${r.conclusion || r.status}`).join(", ") || "none"}`);
             core.info(`pending: ${pending.join(", ") || "none"} | failed: ${failed.join(", ") || "none"}`);
 
-            // 3) Inspect existing gate threads (GraphQL so we can see resolution state).
-            const threadData = await github.graphql(
-              `query ($owner: String!, $repo: String!, $pr: Int!) {
-                repository(owner: $owner, name: $repo) {
-                  pullRequest(number: $pr) {
-                    reviewThreads(first: 100) {
-                      nodes { isResolved comments(first: 20) { nodes { databaseId body } } }
-                    }
-                  }
-                }
-              }`,
-              { owner, repo, pr: pull_number },
+            // 3) Find our existing open blocking review(s) — only the bot's, only ours (marker).
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number, per_page: 100,
+            });
+            const ourActiveBlocks = reviews.filter(
+              (r) => r.state === "CHANGES_REQUESTED" && r.user?.login === BOT && (r.body || "").includes(MARKER),
             );
-            const threads = threadData.repository.pullRequest.reviewThreads.nodes;
-            const markerThreads = threads.filter((t) =>
-              t.comments.nodes.some((c) => (c.body || "").includes(MARKER)),
-            );
-            const markerCommentIds = markerThreads.flatMap((t) =>
-              t.comments.nodes.filter((c) => (c.body || "").includes(MARKER)).map((c) => c.databaseId),
-            );
-            const hasUnresolvedMarker = markerThreads.some((t) => !t.isResolved);
 
-            async function deleteMarkerComments() {
-              for (const id of markerCommentIds) {
-                await github.rest.pulls.deleteReviewComment({ owner, repo, comment_id: id });
+            async function dismissOurBlocks() {
+              for (const r of ourActiveBlocks) {
+                await github.rest.pulls.dismissReview({
+                  owner, repo, pull_number, review_id: r.id, message: "All web CI gates passed — gate cleared.",
+                });
               }
-              if (markerCommentIds.length) core.info(`Deleted ${markerCommentIds.length} gate comment(s).`);
+              if (ourActiveBlocks.length) core.info(`Dismissed ${ourActiveBlocks.length} gate review(s).`);
             }
 
             // 4) Decide.
             if (failed.length > 0) {
-              // Already blocking with a live (unresolved) thread → idempotent no-op.
-              if (hasUnresolvedMarker) {
-                core.info("An unresolved gate comment already blocks this PR; leaving it.");
-                return;
-              }
-              // Either no gate comment, or it was resolved (a bypass). Remove any stale
-              // ones and post a FRESH thread — a new thread is unresolved by default, so
-              // resolving-then-pushing-still-red re-blocks the PR.
-              await deleteMarkerComments();
-
-              const files = await github.paginate(github.rest.pulls.listFiles, {
-                owner, repo, pull_number, per_page: 100,
-              });
-              const target = files.find((f) => f.status !== "removed") || files[0];
-              if (!target) {
-                core.warning("No changed file to attach the block comment to; cannot post block.");
+              // Already blocking with an open gate review → idempotent no-op.
+              if (ourActiveBlocks.length > 0) {
+                core.info("An open gate review already blocks this PR; leaving it.");
                 return;
               }
               const body = [
@@ -157,21 +138,21 @@ jobs:
                 `The following web CI gate(s) did not pass:`,
                 ...failed.map((n) => `- \`${n}\``),
                 ``,
-                `This PR is blocked until they pass. Push a fix or re-run the job — this comment is removed automatically when all web gates are green.`,
+                `This PR is blocked until they pass. See the [Checks tab](${server}/${owner}/${repo}/pull/${pull_number}/checks). ` +
+                  `This review is dismissed automatically when all web gates are green.`,
               ].join("\n");
-              await github.rest.pulls.createReviewComment({
-                owner, repo, pull_number, body,
-                commit_id: pr.head.sha, path: target.filename, subject_type: "file",
+              await github.rest.pulls.createReview({
+                owner, repo, pull_number, event: "REQUEST_CHANGES", body,
               });
-              core.info(`Posted block comment on ${target.filename}.`);
+              core.info("Submitted REQUEST_CHANGES gate review.");
               return;
             }
 
             if (pending.length > 0) {
-              core.info("Some web gates still pending; leaving comment state unchanged.");
+              core.info("Some web gates still pending; leaving review state unchanged.");
               return;
             }
 
-            // Nothing failed, nothing pending → all clear: remove any gate comments.
-            await deleteMarkerComments();
+            // Nothing failed, nothing pending → all clear: dismiss our gate review(s).
+            await dismissOurBlocks();
             core.info("All web gates passed; PR not blocked by web CI.");
