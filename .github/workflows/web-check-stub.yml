@@ -7,9 +7,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Simulated type check (slow)
+      - name: Simulated type check
         run: |
-          echo "running checks..."; sleep 75
+          echo "running checks..."; sleep 20
           if grep -q FAIL status.txt; then
             echo "::error::Type error found (simulated)"; exit 1
           fi
