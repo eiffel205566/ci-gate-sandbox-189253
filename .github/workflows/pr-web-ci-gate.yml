@@ -1,12 +1,12 @@
-name: "PR Web CI Gate"
+name: "PR Front-end CI Gate"
 
-# Block-by-default merge gate for the WillowApp Web pipeline.
+# Block-by-default merge gate for the WillowApp front-end (Web + Mobile) pipeline.
 #
-# A web PR is blocked the moment it opens and stays blocked until Web CI is
-# confirmed green. One persistent github-actions[bot] review carries the block,
-# moving through three states:
-#   * on open / push  -> "⏳ waiting for Web CI"      (blocks immediately)
-#   * any check fails  -> "⛔ Web CI failed: <links>"  (same review, updated body)
+# A front-end PR is blocked the moment it opens and stays blocked until front-end
+# CI is confirmed green. One persistent github-actions[bot] review carries the
+# block, moving through three states:
+#   * on open / push  -> "⏳ waiting for front-end CI"      (blocks immediately)
+#   * any check fails  -> "⛔ front-end CI failed: <links>"  (same review, updated body)
 #   * all checks pass  -> dismissed                    (merge unblocks)
 #
 # Why a review blocks the merge: `main` enforces "Require pull request reviews",
@@ -34,13 +34,15 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened]
     paths:
-      - status.txt
+      - web_status.txt
+      - mobile_status.txt
   # Re-evaluate when a watched workflow finishes.
   workflow_run:
     workflows:
       - "Platform - Web - Format & Type check"
       - "Platform - Web - Test"
       - "Platform - Web - Build"
+      - "Platform - Mobile - Build"
     types: [completed]
 
 permissions:
@@ -60,7 +62,7 @@ jobs:
     if: ${{ github.event_name == 'pull_request' || github.event.workflow_run.event == 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Evaluate web gates and update blocking review
+      - name: Evaluate front-end gates and update blocking review
         uses: actions/github-script@v7
         with:
           script: |
@@ -68,6 +70,7 @@ jobs:
               "Platform - Web - Format & Type check",
               "Platform - Web - Test",
               "Platform - Web - Build",
+              "Platform - Mobile - Build",
             ];
             const MARKER = "<!-- ci-gate:web -->";
             const BOT = "github-actions[bot]";
@@ -125,20 +128,20 @@ jobs:
 
             const WAIT_BODY = [
               MARKER,
-              `### ⏳ Merge blocked — waiting for Web CI`,
+              `### ⏳ Merge blocked — waiting for front-end CI`,
               ``,
-              `Web CI is still running. This review updates with any failures and is ` +
-                `dismissed automatically once all web checks pass.`,
+              `Front-end CI (Web + Mobile) is still running. This review updates with any ` +
+                `failures and is dismissed automatically once all checks pass.`,
             ].join("\n");
 
             const failBody = () => [
               MARKER,
-              `### ⛔ Merge blocked — Web CI failed`,
+              `### ⛔ Merge blocked — front-end CI failed`,
               ``,
-              `These web CI checks failed — open them to see why and fix:`,
+              `These front-end CI checks failed — open them to see why and fix:`,
               ...failedRuns.map((r) => `- [\`${r.name}\`](${r.html_url}) ❌`),
               ``,
-              `Push a fix (or re-run the job). This review is dismissed automatically once all web checks pass.`,
+              `Push a fix (or re-run the job). This review is dismissed automatically once all checks pass.`,
             ].join("\n");
 
             async function dismissOurBlocks() {

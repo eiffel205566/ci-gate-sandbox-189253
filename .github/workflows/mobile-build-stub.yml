@@ -1,0 +1,12 @@
+name: "Platform - Mobile - Build"
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  build_mobile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          if grep -q FAIL mobile_status.txt; then echo "::error::mobile failed"; exit 1; fi
+          echo "mobile ok"
